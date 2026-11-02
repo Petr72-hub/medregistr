@@ -6,15 +6,12 @@ from PyQt6.QtWidgets import *
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
-DB_NAME = "children.db"
-FILES_DIR = "files"
-if not os.path.exists(FILES_DIR):
-    os.makedirs(FILES_DIR)
+from uuid import uuid4
+from storage import resolve_paths, prepare_database, save_analyses
 
-MKB_CODES = [
-    "K29 Гастрит", "K21 ГЭРБ", "K52 Гастроэнтерит", "K25 Язва желудка",
-    "K26 Язва 12ПК", "K58 СРК", "E11 Диабет", "B15 Гепатит A"
-]
+DB_NAME, FILES_DIR = resolve_paths()
+
+from diagnoses import MKB_CODES
 
 CLINICS = ["Поликлиника №1", "Поликлиника №2", "Поликлиника №5"]
 
@@ -114,117 +111,7 @@ STAGES = ["Индукция", "Поддерживающая терапия", "И
 # =========================
 # ОФОРМЛЕНИЕ
 # =========================
-STYLE_SHEET = """
-QWidget {
-    background-color: #F4F7FB;
-    color: #1F2937;
-    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    font-size: 14px;
-}
-QDialog, QMainWindow { background-color: #F4F7FB; }
-
-QLabel { color: #1F2937; }
-QLabel[role="title"] { font-size: 18px; font-weight: 600; color: #0F172A; }
-QLabel[role="muted"] { color: #64748B; font-size: 12px; }
-
-QGroupBox {
-    border: 1px solid #DCE3ED;
-    border-radius: 10px;
-    margin-top: 12px;
-    padding: 10px;
-    background-color: #FFFFFF;
-    font-weight: 600;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 6px;
-    color: #2563EB;
-}
-
-QLineEdit, QComboBox, QDateEdit {
-    background-color: #FFFFFF;
-    border: 1px solid #D7DEE9;
-    border-radius: 8px;
-    padding: 6px 10px;
-    min-height: 22px;
-}
-QLineEdit:focus, QComboBox:focus {
-    border: 1px solid #2563EB;
-}
-QComboBox::drop-down { border: none; width: 22px; }
-
-QPushButton {
-    background-color: #2563EB;
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 8px 16px;
-    font-weight: 600;
-}
-QPushButton:hover { background-color: #1D4ED8; }
-QPushButton:pressed { background-color: #1E40AF; }
-QPushButton:disabled { background-color: #B9C4D6; color: #EEF2F7; }
-
-QPushButton[role="secondary"] {
-    background-color: #E7ECF5;
-    color: #1F2937;
-}
-QPushButton[role="secondary"]:hover { background-color: #D9E1EF; }
-
-QPushButton[role="danger"] {
-    background-color: #EF4444;
-}
-QPushButton[role="danger"]:hover { background-color: #DC2626; }
-
-QPushButton[role="accent"] {
-    background-color: #10B981;
-}
-QPushButton[role="accent"]:hover { background-color: #059669; }
-
-QTableWidget {
-    background-color: #FFFFFF;
-    alternate-background-color: #F7F9FC;
-    gridline-color: #E5EAF2;
-    border: 1px solid #DCE3ED;
-    border-radius: 10px;
-    selection-background-color: #DBEAFE;
-    selection-color: #0F172A;
-}
-QHeaderView::section {
-    background-color: #EEF2F9;
-    color: #334155;
-    padding: 8px;
-    border: none;
-    border-bottom: 2px solid #DCE3ED;
-    font-weight: 600;
-}
-QTableWidget::item { padding: 4px; }
-
-QTabWidget::pane {
-    border: 1px solid #DCE3ED;
-    border-radius: 10px;
-    background-color: #FFFFFF;
-    top: -1px;
-}
-QTabBar::tab {
-    background: #E7ECF5;
-    color: #334155;
-    padding: 8px 18px;
-    margin-right: 4px;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-    font-weight: 600;
-}
-QTabBar::tab:selected {
-    background: #2563EB;
-    color: white;
-}
-
-QCheckBox { spacing: 8px; }
-QScrollBar:vertical { width: 10px; background: transparent; }
-QScrollBar::handle:vertical { background: #C7D0DE; border-radius: 5px; }
-"""
+from design import STYLE_SHEET, configure_app
 
 
 def calc_vials(total_mg, vial_mg):
@@ -299,6 +186,7 @@ ANALYSIS_DEFS = {
 # DB
 # =========================
 def init_db():
+    prepare_database(DB_NAME)
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     cur.execute("""
@@ -377,6 +265,8 @@ def init_db():
             cur.execute(f"ALTER TABLE patients ADD COLUMN {col_name} {col_type}")
     con.commit()
     con.close()
+    from medication import initialize_medication
+    initialize_medication(DB_NAME)
 
 
 def confirm(parent, text):
@@ -436,60 +326,11 @@ def get_stock_summary():
 
 
 def get_forecast(target_date):
-    """Прогноз потребности в препаратах до заданной даты (datetime), на основе
-    последних сохранённых назначений "Поддерживающая терапия"/"Интенсификация"
-    у каждого пациента и их интервала между введениями."""
-    con = sqlite3.connect(DB_NAME)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT pid, drug, date, interval_weeks, vials_count
-        FROM therapy
-        WHERE stage IN ('Поддерживающая терапия', 'Интенсификация')
-          AND interval_weeks IS NOT NULL
-        ORDER BY id
-    """)
-    rows = cur.fetchall()
-    con.close()
-
-    # оставляем только самое последнее (по дате) назначение на каждую пару пациент+препарат
-    latest = {}
-    for pid, drug, date_str, interval_weeks, vials_count in rows:
-        d = parse_date(date_str)
-        if not d:
-            continue
-        key = (pid, drug)
-        if key not in latest or d > latest[key]["date"]:
-            latest[key] = {"date": d, "interval_weeks": interval_weeks, "vials_count": vials_count}
-
-    needed_vials = {drug: 0 for drug in DRUGS}
-    for (pid, drug), info in latest.items():
-        if drug not in DRUGS:
-            continue
-        interval_days = (info["interval_weeks"] or 0) * 7
-        if interval_days <= 0:
-            continue
-        delta_days = (target_date - info["date"]).days
-        if delta_days <= 0:
-            continue
-        doses_count = int(delta_days // interval_days)
-        needed_vials[drug] += doses_count * (info["vials_count"] or 0)
-
-    stock = {s["drug"]: s for s in get_stock_summary()}
-
-    result = []
-    for drug in DRUGS:
-        current_balance = stock[drug]["balance_vials"] if drug in stock else 0
-        need = needed_vials.get(drug, 0)
-        after = current_balance - need
-        to_order = max(0, -after)
-        result.append({
-            "drug": drug,
-            "current_balance_vials": current_balance,
-            "needed_vials_by_date": need,
-            "projected_balance_vials": after,
-            "to_order_vials": to_order,
-        })
-    return result
+    """Compatibility view over the dated plan and actual stock ledger."""
+    from medication import forecast
+    return [{"drug": drug, "current_balance_vials": m["current_balance"],
+             "needed_vials_by_date": m["reserve"], "projected_balance_vials": m["projected_balance"],
+             "to_order_vials": m["shortage"]} for drug, m in forecast(DB_NAME, target_date).items()]
 
 
 # =========================
@@ -500,111 +341,95 @@ class PatientForm(QDialog):
         super().__init__()
         self.p = p
         self.readonly = readonly
-        self.setWindowTitle("Пациент — просмотр" if readonly else "Пациент")
-        self.resize(600, 750)
+        self.setWindowTitle("Паспортная часть — просмотр" if readonly else "Паспортная часть")
+        self.resize(900, 720)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 24, 24, 24)
+        outer.setSpacing(16)
+        title = QLabel("Паспортная часть" if p else "Новый пациент")
+        title.setProperty("role", "title")
+        outer.addWidget(title)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        form = QWidget()
+        form.setObjectName("workSheet")
+        grid = QGridLayout(form)
+        grid.setContentsMargins(20, 20, 20, 20)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(12)
+        for col in range(6):
+            grid.setColumnStretch(col, 1)
 
-        l = QVBoxLayout()
+        def field(label, widget, row, col, span=2):
+            caption = QLabel(label)
+            caption.setBuddy(widget)
+            widget.setAccessibleName(label)
+            box = QVBoxLayout()
+            box.setSpacing(6)
+            box.addWidget(caption)
+            box.addWidget(widget)
+            grid.addLayout(box, row, col, 1, span)
 
-        self.last = QLineEdit()
-        self.last.setPlaceholderText("Фамилия")
-        self.first = QLineEdit()
-        self.first.setPlaceholderText("Имя")
-        self.middle = QLineEdit()
-        self.middle.setPlaceholderText("Отчество")
-
-        l.addWidget(QLabel("Фамилия"))
-        l.addWidget(self.last)
-        l.addWidget(QLabel("Имя"))
-        l.addWidget(self.first)
-        l.addWidget(QLabel("Отчество"))
-        l.addWidget(self.middle)
-
+        self.last, self.first, self.middle = QLineEdit(), QLineEdit(), QLineEdit()
+        field("Фамилия", self.last, 0, 0)
+        field("Имя", self.first, 0, 2)
+        field("Отчество", self.middle, 0, 4)
         self.birth = QLineEdit()
         self.birth.setPlaceholderText("ДД.ММ.ГГГГ")
         self.birth.textChanged.connect(self.format_date)
-        l.addWidget(QLabel("Дата рождения"))
-        l.addWidget(self.birth)
-
         self.gender = QComboBox()
         self.gender.addItems(["Мальчик", "Девочка"])
-        l.addWidget(QLabel("Пол"))
-        l.addWidget(self.gender)
-
         self.mkb = QComboBox()
         self.mkb.addItems(MKB_CODES)
-        l.addWidget(QLabel("Диагноз МКБ-10"))
-        l.addWidget(self.mkb)
-
-        self.addr_reg = QLineEdit()
-        self.addr_reg.setPlaceholderText("Адрес регистрации")
-        l.addWidget(QLabel("Адрес регистрации"))
-        l.addWidget(self.addr_reg)
-
-        self.addr_fact = QLineEdit()
-        self.addr_fact.setPlaceholderText("Адрес фактический")
-        l.addWidget(QLabel("Адрес фактический"))
-        l.addWidget(self.addr_fact)
-
+        field("Дата рождения", self.birth, 1, 0)
+        field("Пол", self.gender, 1, 2)
+        field("Диагноз МКБ-10", self.mkb, 1, 4)
+        self.addr_reg, self.addr_fact = QLineEdit(), QLineEdit()
+        field("Адрес регистрации", self.addr_reg, 2, 0, 3)
+        field("Фактический адрес", self.addr_fact, 2, 3, 3)
         self.btn_copy = QPushButton("АР совпадает АФ")
         self.btn_copy.clicked.connect(lambda: self.addr_fact.setText(self.addr_reg.text()))
-        l.addWidget(self.btn_copy)
-
+        grid.addWidget(self.btn_copy, 3, 3, 1, 3)
         self.clinic = QComboBox()
         self.clinic.addItems(CLINICS)
-        l.addWidget(QLabel("Поликлиника"))
-        l.addWidget(self.clinic)
-
         self.uch = QLineEdit()
-        self.uch.setPlaceholderText("Участок")
-        l.addWidget(QLabel("Участок"))
-        l.addWidget(self.uch)
-
-        self.doctor = QLineEdit()
-        self.doctor.setPlaceholderText("ФИО ведущего педиатра")
-        l.addWidget(QLabel("Ведущий педиатр"))
-        l.addWidget(self.doctor)
-
-        self.phone = QLineEdit()
+        field("Поликлиника", self.clinic, 4, 0, 3)
+        field("Участок", self.uch, 4, 3, 3)
+        self.doctor, self.phone = QLineEdit(), QLineEdit()
         self.phone.setPlaceholderText("+7(9XX)-XXX-XX-XX")
         self.phone.textChanged.connect(self.format_phone)
-        l.addWidget(QLabel("Номер телефона"))
-        l.addWidget(self.phone)
-
+        field("Ведущий педиатр — ФИО", self.doctor, 5, 0, 3)
+        field("Мобильный телефон", self.phone, 5, 3, 3)
         self.invalid = QCheckBox("Ребёнок инвалид")
-        l.addWidget(self.invalid)
-
         self.weight = QLineEdit()
-        self.weight.setPlaceholderText("Вес, кг (например 28.5)")
-        l.addWidget(QLabel("Вес пациента, кг (для расчёта доз препаратов)"))
-        l.addWidget(self.weight)
-
-        btn_row = QHBoxLayout()
+        self.weight.setPlaceholderText("Например, 28,5")
+        field("Вес, кг", self.weight, 6, 0, 3)
+        grid.addWidget(self.invalid, 6, 3, 1, 3)
+        grid.setRowStretch(7, 1)
+        scroll.setWidget(form)
+        outer.addWidget(scroll, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
         if readonly:
             close_btn = QPushButton("Закрыть")
-            close_btn.setProperty("role", "secondary")
             close_btn.clicked.connect(self.accept)
-            btn_row.addWidget(close_btn)
+            buttons.addWidget(close_btn)
         else:
-            save = QPushButton("Сохранить")
             cancel = QPushButton("Отмена")
-            cancel.setProperty("role", "secondary")
-            save.clicked.connect(self.save)
             cancel.clicked.connect(self.cancel)
-            btn_row.addWidget(save)
-            btn_row.addWidget(cancel)
-        l.addLayout(btn_row)
-
-        self.setLayout(l)
-
+            save = QPushButton("Сохранить")
+            save.setProperty("role", "primary")
+            save.clicked.connect(self.save)
+            buttons.addWidget(cancel)
+            buttons.addWidget(save)
+        outer.addLayout(buttons)
         if p:
             self.load_data()
-
         if readonly:
-            for w in [self.last, self.first, self.middle, self.birth, self.gender,
-                      self.mkb, self.addr_reg, self.addr_fact, self.btn_copy,
-                      self.clinic, self.uch, self.doctor, self.phone, self.invalid,
-                      self.weight]:
-                w.setEnabled(False)
+            for widget in (self.last, self.first, self.middle, self.birth, self.gender,
+                           self.mkb, self.addr_reg, self.addr_fact, self.btn_copy,
+                           self.clinic, self.uch, self.doctor, self.phone, self.invalid, self.weight):
+                widget.setEnabled(False)
 
     def format_date(self):
         t = self.birth.text().replace(".", "")
@@ -617,71 +442,91 @@ class PatientForm(QDialog):
 
     def format_phone(self):
         digits = re.sub(r"\D", "", self.phone.text())
-        if digits.startswith("8"):
-            digits = "7" + digits[1:]
-        if len(digits) >= 11:
+        if len(digits) == 10 and digits.startswith("9"):
+            digits = "7" + digits
+        if len(digits) == 11 and digits[0] in "78":
             formatted = f"+7({digits[1:4]})-{digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
             self.phone.blockSignals(True)
             self.phone.setText(formatted)
             self.phone.blockSignals(False)
 
     def save(self):
-        if not confirm(self, "Вы уверены, что хотите сохранить?"):
+        if self.readonly:
             return
-
         if not self.last.text().strip() or not self.first.text().strip():
             QMessageBox.warning(self, "Ошибка", "Заполните хотя бы фамилию и имя.")
             return
-
+        try:
+            birth = datetime.strptime(self.birth.text().strip(), "%d.%m.%Y")
+            if birth.date() > datetime.now().date():
+                raise ValueError()
+        except ValueError:
+            QMessageBox.warning(self, "Ошибка", "Укажите действительную дату рождения ДД.ММ.ГГГГ, не позднее сегодняшнего дня.")
+            return
+        self.format_phone()
+        phone = self.phone.text().strip()
+        if phone and not re.fullmatch(r"\+7\(9\d{2}\)-\d{3}-\d{2}-\d{2}", phone):
+            QMessageBox.warning(self, "Ошибка", "Введите мобильный номер: +7(9XX)-XXX-XX-XX.")
+            return
         weight_text = self.weight.text().strip().replace(",", ".")
         weight_val = None
         if weight_text:
             try:
                 weight_val = float(weight_text)
+                if not math.isfinite(weight_val) or weight_val <= 0:
+                    raise ValueError()
             except ValueError:
-                QMessageBox.warning(self, "Ошибка", "Вес должен быть числом, например 28.5")
+                QMessageBox.warning(self, "Ошибка", "Вес должен быть положительным числом, например 28.5.")
                 return
-
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-
+        if not confirm(self, "Вы уверены, что хотите сохранить?"):
+            return
         data = (
-            self.last.text(), self.first.text(), self.middle.text(),
-            self.birth.text(), self.mkb.currentText(),
-            self.gender.currentText(),
-            self.addr_reg.text(), self.addr_fact.text(),
-            self.clinic.currentText(), self.uch.text(),
-            self.doctor.text(), self.phone.text(),
-            int(self.invalid.isChecked()), weight_val
+            self.last.text().strip(), self.first.text().strip(), self.middle.text().strip(),
+            birth.strftime("%d.%m.%Y"), self.mkb.currentText(), self.gender.currentText(),
+            self.addr_reg.text(), self.addr_fact.text(), self.clinic.currentText(),
+            self.uch.text(), self.doctor.text(), phone, int(self.invalid.isChecked()), weight_val
         )
-
-        if self.p:
-            cur.execute("""
-            UPDATE patients SET
-            last=?,first=?,middle=?,birth=?,mkb=?,gender=?,
-            address_reg=?,address_fact=?,clinic=?,uch=?,doctor=?,phone=?,invalid=?,weight=?
-            WHERE id=?
-            """, (*data, self.p[0]))
-            self.saved_id = self.p[0]
-        else:
-            cur.execute("""
-            INSERT INTO patients(
-            last,first,middle,birth,mkb,gender,address_reg,address_fact,
-            clinic,uch,doctor,phone,invalid,weight
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, data)
-            self.saved_id = cur.lastrowid
-
-        con.commit()
-        con.close()
+        con = None
+        try:
+            con = sqlite3.connect(DB_NAME)
+            with con:
+                if self.p:
+                    result = con.execute("""UPDATE patients SET
+                        last=?,first=?,middle=?,birth=?,mkb=?,gender=?,address_reg=?,address_fact=?,
+                        clinic=?,uch=?,doctor=?,phone=?,invalid=?,weight=? WHERE id=?""", (*data, self.p[0]))
+                    if result.rowcount != 1:
+                        raise ValueError("Пациент уже удалён. Обновите список.")
+                    self.saved_id = self.p[0]
+                else:
+                    self.saved_id = con.execute("""INSERT INTO patients(
+                        last,first,middle,birth,mkb,gender,address_reg,address_fact,
+                        clinic,uch,doctor,phone,invalid,weight) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", data).lastrowid
+        except (sqlite3.Error, ValueError) as exc:
+            QMessageBox.warning(self, "Ошибка сохранения", str(exc))
+            return
+        finally:
+            if con is not None:
+                con.close()
         self.accept()
 
     def cancel(self):
-        if confirm(self, "Вы уверены, что хотите отменить?"):
-            self.reject()
+        self.reject()
+
+    def reject(self):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            event.accept()
+        else:
+            event.ignore()
 
     def load_data(self):
-        p = self.p
+        p = tuple("" if value is None else value for value in self.p)
+        for combo, value in [(self.mkb, p[5]), (self.gender, p[6]), (self.clinic, p[9])]:
+            if value and combo.findText(value) == -1:
+                combo.addItem(value)
         self.last.setText(p[1])
         self.first.setText(p[2])
         self.middle.setText(p[3])
@@ -707,196 +552,205 @@ class AnalysisWindow(QDialog):
         super().__init__()
         self.pid = pid
         self.readonly = readonly
-        self.blocks = []  # list of dicts: type, start, count, file, db_id, btn
-
+        self.blocks = []
         self.setWindowTitle("Анализы — просмотр" if readonly else "Анализы")
-        self.resize(750, 550)
-
-        l = QVBoxLayout()
-
-        self.t = QTableWidget()
-        self.t.setColumnCount(5)
-        self.t.setHorizontalHeaderLabels(
-            ["Анализ", "Показатель", "Результат", "Ед. изм.", "Файл"]
-        )
+        self.resize(900, 600)
+        layout = QVBoxLayout(self)
+        self.t = QTableWidget(0, 5)
+        self.t.setHorizontalHeaderLabels(["Анализ", "Показатель", "Результат", "Ед. изм.", "Файл"])
         self.t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        l.addWidget(self.t)
-
-        btn_row = QHBoxLayout()
+        layout.addWidget(self.t)
+        buttons = QHBoxLayout()
         if not readonly:
-            add_btn = QPushButton("+")
-            add_btn.setFixedWidth(40)
-            add_btn.clicked.connect(self.on_add)
-            btn_row.addWidget(add_btn)
-
-        btn_row.addStretch()
-
-        if readonly:
-            close_btn = QPushButton("Закрыть")
-            close_btn.setProperty("role", "secondary")
-            close_btn.clicked.connect(self.accept)
-            btn_row.addWidget(close_btn)
-        else:
-            save_btn = QPushButton("Сохранить")
-            cancel_btn = QPushButton("Отмена")
-            cancel_btn.setProperty("role", "secondary")
-            save_btn.clicked.connect(self.save)
-            cancel_btn.clicked.connect(self.cancel)
-            btn_row.addWidget(save_btn)
-            btn_row.addWidget(cancel_btn)
-
-        l.addLayout(btn_row)
-        self.setLayout(l)
-
+            add = QPushButton("+")
+            add.clicked.connect(self.on_add)
+            buttons.addWidget(add)
+            save = QPushButton("Сохранить")
+            save.clicked.connect(self.save)
+            buttons.addWidget(save)
+        close = QPushButton("Закрыть" if readonly else "Отмена")
+        close.clicked.connect(self.accept if readonly else self.cancel)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
         self.load_existing()
 
     def load_existing(self):
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        cur.execute("SELECT id, type, data, file FROM analyses WHERE pid=? ORDER BY id", (self.pid,))
-        rows = cur.fetchall()
-        con.close()
-        for rid, atype, data_json, file_path in rows:
-            data = json.loads(data_json) if data_json else {}
-            if atype not in ANALYSIS_DEFS:
-                continue
-            self.add_block(atype, values=data, file_path=file_path, db_id=rid)
+        from storage import load_analyses
+        try:
+            rows = load_analyses(DB_NAME, self.pid)
+        except (sqlite3.Error, ValueError) as exc:
+            QMessageBox.warning(self, "Ошибка загрузки", str(exc))
+            self.readonly = True
+            return
+        for record in rows:
+            self.add_block(record["type"], record["data"], record["file"],
+                           record["db_id"], malformed=record.get("malformed", False))
 
     def on_add(self):
-        atype, ok = QInputDialog.getItem(
-            self, "Добавить анализ", "Выберите тип анализа:",
-            list(ANALYSIS_DEFS.keys()), 0, False
-        )
-        if ok and atype:
-            self.add_block(atype)
+        if not self.readonly:
+            self.add_block("")
 
-    def add_block(self, atype, values=None, file_path=None, db_id=None):
-        defs = ANALYSIS_DEFS[atype]
+    def add_block(self, atype, values=None, file_path=None, db_id=None, malformed=False):
+        values = dict(values or {})
+        definitions = list(ANALYSIS_DEFS.get(atype, []))
+        known = {label for label, _ in definitions}
+        definitions.extend((str(key), "") for key in values if key not in known)
+        if not definitions:
+            definitions = [("Выберите тип анализа" if not atype else "Результат", "")]
         start = self.t.rowCount()
-        self.t.setRowCount(start + len(defs))
-
-        for i, (label, unit) in enumerate(defs):
-            row = start + i
-
-            item0 = QTableWidgetItem(atype if i == 0 else "")
-            item0.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 0, item0)
-
-            item1 = QTableWidgetItem(label)
-            item1.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 1, item1)
-
-            val = values.get(label, "") if values else ""
-            item2 = QTableWidgetItem(val)
-            if self.readonly:
-                item2.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 2, item2)
-
-            item3 = QTableWidgetItem(unit)
-            item3.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 3, item3)
-
-        self.t.setSpan(start, 0, len(defs), 1)
-        self.t.setSpan(start, 4, len(defs), 1)
-
-        idx = len(self.blocks)
+        self.t.setRowCount(start + len(definitions))
+        block = {"type": atype, "start": start, "count": len(definitions), "file": file_path,
+                 "db_id": db_id, "values": values, "malformed": malformed, "pending_file": None}
+        self.blocks.append(block)
+        idx = len(self.blocks) - 1
+        for offset, (label, unit) in enumerate(definitions):
+            row = start + offset
+            for column, text in [(0, atype if offset == 0 else ""), (1, label),
+                                 (2, str(values.get(label, ""))), (3, unit)]:
+                item = QTableWidgetItem(text)
+                if column != 2 or self.readonly or malformed or not atype or isinstance(values.get(label), (dict, list)):
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.t.setItem(row, column, item)
+        if len(definitions) > 1:
+            self.t.setSpan(start, 0, len(definitions), 1)
+            self.t.setSpan(start, 4, len(definitions), 1)
+        if not atype:
+            choice = QComboBox()
+            choice.addItem("Выберите анализ…")
+            choice.addItems(ANALYSIS_DEFS)
+            choice.currentTextChanged.connect(partial(self.select_type, idx))
+            self.t.setCellWidget(start, 0, choice)
+        elif malformed:
+            self.t.item(start, 0).setText(f"{atype} (старые данные, только просмотр)")
         btn = QPushButton()
-        self.blocks.append({
-            "type": atype, "start": start, "count": len(defs),
-            "file": file_path, "db_id": db_id, "btn": btn
-        })
-        self.update_file_btn(idx)
+        block["btn"] = btn
         btn.clicked.connect(partial(self.handle_file, idx))
         self.t.setCellWidget(start, 4, btn)
+        self.update_file_btn(idx)
+
+    def block_values(self, block):
+        values = dict(block["values"])
+        for offset in range(block["count"]):
+            row = block["start"] + offset
+            label = self.t.item(row, 1).text()
+            if not isinstance(values.get(label), (dict, list)):
+                values[label] = self.t.item(row, 2).text()
+        return values
+
+    def select_type(self, idx, atype):
+        if atype not in ANALYSIS_DEFS:
+            return
+        records = []
+        for index, block in enumerate(self.blocks):
+            records.append((atype if index == idx else block["type"],
+                            {} if index == idx else self.block_values(block),
+                            block["file"], block["db_id"], block["malformed"], block["pending_file"]))
+        self.blocks = []
+        self.t.clearSpans()
+        self.t.setRowCount(0)
+        for kind, values, path, rid, malformed, pending in records:
+            self.add_block(kind, values, path, rid, malformed)
+            self.blocks[-1]["pending_file"] = pending
+            self.update_file_btn(len(self.blocks) - 1)
 
     def update_file_btn(self, idx):
         block = self.blocks[idx]
-        btn = block["btn"]
-        if block["file"]:
-            btn.setText(f"📎 {os.path.basename(block['file'])}")
-        else:
-            btn.setText("Нет файла" if self.readonly else "Добавить файл")
-            if self.readonly:
-                btn.setEnabled(False)
+        path = block["pending_file"] or block["file"]
+        block["btn"].setText(os.path.basename(path) if path else
+                             ("Нет файла" if self.readonly else "Добавить файл"))
+        block["btn"].setEnabled(bool(path) or (not self.readonly and not block["malformed"]))
+
+    def file_path(self, path):
+        if os.path.isabs(path):
+            return path
+        database_dir = os.path.dirname(os.path.abspath(DB_NAME))
+        resolved = os.path.join(database_dir, path)
+        if not os.path.isfile(resolved) and os.path.basename(database_dir).lower() == "dist":
+            legacy = os.path.abspath(os.path.join(database_dir, os.pardir, path))
+            legacy_files = os.path.abspath(os.path.join(database_dir, os.pardir, "files"))
+            if os.path.commonpath([legacy, legacy_files]) == legacy_files and os.path.isfile(legacy):
+                return legacy
+        return resolved
+
+    def open_file(self, path):
+        resolved = self.file_path(path)
+        if not os.path.isfile(resolved):
+            QMessageBox.warning(self, "Файл", "Файл не найден на диске.")
+        elif not QDesktopServices.openUrl(QUrl.fromLocalFile(resolved)):
+            QMessageBox.warning(self, "Файл", "Не удалось открыть файл. Проверьте приложение для этого типа файлов.")
 
     def handle_file(self, idx):
         block = self.blocks[idx]
-
-        if self.readonly:
-            if block["file"] and os.path.exists(block["file"]):
-                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(block["file"])))
-            else:
-                QMessageBox.information(self, "Файл", "Файл не найден.")
+        path = block["pending_file"] or block["file"]
+        if self.readonly or block["malformed"]:
+            if path:
+                self.open_file(path)
             return
-
-        if block["file"]:
+        if path:
             box = QMessageBox(self)
             box.setWindowTitle("Файл анализа")
             box.setText("Файл уже прикреплён. Что сделать?")
             open_btn = box.addButton("Открыть", QMessageBox.ButtonRole.AcceptRole)
-            replace_btn = box.addButton("Заменить", QMessageBox.ButtonRole.DestructiveRole)
+            replace_btn = box.addButton("Заменить", QMessageBox.ButtonRole.ActionRole)
             box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
             box.exec()
-            clicked = box.clickedButton()
-            if clicked == open_btn:
-                if os.path.exists(block["file"]):
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(block["file"])))
-                else:
-                    QMessageBox.warning(self, "Файл", "Файл не найден на диске.")
+            if box.clickedButton() == open_btn:
+                self.open_file(path)
                 return
-            elif clicked != replace_btn:
+            if box.clickedButton() != replace_btn:
                 return
-
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл анализа")
-        if not path:
-            return
-
-        os.makedirs(FILES_DIR, exist_ok=True)
-        basename = os.path.basename(path)
-        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        dest_name = f"pid{self.pid}_{block['type']}_{stamp}_{basename}"
-        dest_name = re.sub(r"[^\w\.\-А-Яа-яЁё]", "_", dest_name)
-        dest_path = os.path.join(FILES_DIR, dest_name)
-        shutil.copy(path, dest_path)
-
-        block["file"] = dest_path
-        self.update_file_btn(idx)
+        chosen, _ = QFileDialog.getOpenFileName(self, "Выберите файл анализа")
+        if chosen:
+            block["pending_file"] = os.path.abspath(chosen)
+            self.update_file_btn(idx)
 
     def save(self):
+        if self.readonly:
+            return
+        if any(not block["type"] for block in self.blocks):
+            QMessageBox.warning(self, "Анализы", "Выберите тип каждого добавленного анализа.")
+            return
         if not confirm(self, "Вы уверены, что хотите сохранить?"):
             return
-
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-
-        for block in self.blocks:
-            data = {}
-            for i in range(block["count"]):
-                row = block["start"] + i
-                label = self.t.item(row, 1).text()
-                value = self.t.item(row, 2).text()
-                data[label] = value
-            data_json = json.dumps(data, ensure_ascii=False)
-
-            if block["db_id"]:
-                cur.execute(
-                    "UPDATE analyses SET data=?, file=? WHERE id=?",
-                    (data_json, block["file"], block["db_id"])
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO analyses(pid, type, data, file, created_at) VALUES(?,?,?,?,?)",
-                    (self.pid, block["type"], data_json, block["file"],
-                     datetime.now().strftime("%d.%m.%Y %H:%M"))
-                )
-
-        con.commit()
-        con.close()
+        copied = []
+        records = []
+        try:
+            for block in self.blocks:
+                if block["malformed"]:
+                    continue  # Keep the original invalid JSON untouched in SQLite.
+                path = block["file"]
+                if block["pending_file"]:
+                    os.makedirs(FILES_DIR, exist_ok=True)
+                    name = uuid4().hex + "_" + os.path.basename(block["pending_file"])
+                    destination = os.path.join(FILES_DIR, name)
+                    copied.append(destination)
+                    shutil.copy2(block["pending_file"], destination)
+                    path = os.path.relpath(destination, os.path.dirname(os.path.abspath(DB_NAME)))
+                records.append({"db_id": block["db_id"], "type": block["type"],
+                                "data": self.block_values(block), "file": path})
+            save_analyses(DB_NAME, self.pid, records)
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            for path in copied:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            QMessageBox.warning(self, "Ошибка сохранения", str(exc))
+            return
         self.accept()
 
     def cancel(self):
-        if confirm(self, "Вы уверены, что хотите отменить?"):
-            self.reject()
+        self.reject()
+
+    def reject(self):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            event.accept()
+        else:
+            event.ignore()
 
 
 # =========================
@@ -910,6 +764,7 @@ class AddTherapyDialog(QDialog):
         self.pid = pid
         self.weight_kg = weight_kg
         self.result_data = None
+        self._calc_cache = None
 
         self.setWindowTitle("Добавить назначение препарата")
         self.resize(520, 480)
@@ -981,6 +836,7 @@ class AddTherapyDialog(QDialog):
         l.addLayout(btn_row)
 
         self.setLayout(l)
+        self.diag_box.currentTextChanged.connect(self.recalc)
         self.rebuild()
 
     def current_drug_cfg(self):
@@ -1042,6 +898,7 @@ class AddTherapyDialog(QDialog):
         return doses[week_index]
 
     def recalc(self):
+        self._calc_cache = None
         cfg = self.current_drug_cfg()
         stage = self.stage_box.currentText()
         vial_mg = cfg["vial_mg"]
@@ -1051,8 +908,8 @@ class AddTherapyDialog(QDialog):
         dose_label = "-"
         interval_weeks = None
 
-        if not weight:
-            self.res_dose.setText("Доза: невозможно рассчитать без веса пациента")
+        if not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+            self.res_dose.setText("Доза: укажите конечный положительный вес пациента")
             self.res_total.setText("Требуется, мг: -")
             self.res_vials.setText("Флаконов/шприцов: -")
             self.res_waste.setText("Остаток при введении, мг: -")
@@ -1140,6 +997,14 @@ class AddTherapyDialog(QDialog):
         return bands[0] if bands else None
 
     def save(self):
+        try:
+            date_text = self.date_edit.text().strip()
+            if not re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", date_text):
+                raise ValueError()
+            administration_date = datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
+        except ValueError:
+            QMessageBox.warning(self, "Ошибка", "Укажите действительную дату введения ДД.ММ.ГГГГ.")
+            return
         if not self._calc_cache:
             QMessageBox.warning(self, "Ошибка", "Расчёт дозы не выполнен — проверьте вес пациента и выбранные параметры.")
             return
@@ -1152,7 +1017,7 @@ class AddTherapyDialog(QDialog):
 
         self.result_data = {
             "pid": self.pid,
-            "date": self.date_edit.text(),
+            "date": administration_date,
             "drug": self.drug_box.currentText(),
             "diagnosis": self.diag_box.currentText() if cfg.get("requires_diagnosis") else None,
             "stage": stage,
@@ -1522,16 +1387,19 @@ class PatientCard(QDialog):
         self.pid = pid
         self.mode = mode  # 'view' or 'edit'
         self.setWindowTitle("Просмотр пациента" if mode == "view" else "Редактирование пациента")
-        self.resize(450, 320)
+        self.resize(760, 380)
 
         self.layout_main = QVBoxLayout()
+        self.layout_main.setContentsMargins(24, 24, 24, 24)
+        self.layout_main.setSpacing(20)
         self.info_box = QVBoxLayout()
         self.layout_main.addLayout(self.info_box)
 
         btn_row = QHBoxLayout()
         self.passport_btn = QPushButton("Паспортная часть")
         self.analyses_btn = QPushButton("Анализы")
-        self.therapy_btn = QPushButton("Препараты")
+        self.therapy_btn = QPushButton("План терапии")
+        self.therapy_btn.setProperty("role", "primary")
         self.fed_btn = QPushButton("Федеральный центр")
         self.fed_btn.setProperty("role", "secondary")
 
@@ -1590,12 +1458,13 @@ class PatientCard(QDialog):
     def open_analyses(self):
         readonly = self.mode == "view"
         win = AnalysisWindow(self.pid, readonly=readonly)
-        win.exec()
+        if win.exec() == QDialog.DialogCode.Accepted and not readonly:
+            self.accept()
 
     def open_therapy(self):
-        readonly = self.mode == "view"
-        win = TherapyWindow(self.pid, readonly=readonly)
-        win.exec()
+        from medication_ui import TherapyPlanner
+        TherapyPlanner(DB_NAME, self.pid, readonly=self.mode == "view", parent=self).exec()
+        self.refresh_patient()
 
 
 # =========================
@@ -1604,63 +1473,102 @@ class PatientCard(QDialog):
 class App(QWidget):
     def __init__(self):
         super().__init__()
+        self.setObjectName("applicationFrame")
         self.setWindowTitle("МедРегистр")
-        self.resize(980, 560)
-
-        l = QVBoxLayout()
-        l.setContentsMargins(16, 16, 16, 16)
-        l.setSpacing(10)
-
-        title = QLabel("МедРегистр — детская гастроэнтерология")
+        self.resize(1280, 800)
+        self.setMinimumSize(900, 620)
+        frame = QHBoxLayout(self)
+        frame.setContentsMargins(16, 16, 16, 16)
+        frame.setSpacing(16)
+        nav_widget = QWidget()
+        nav_widget.setFixedWidth(196)
+        nav = QVBoxLayout(nav_widget)
+        nav.setContentsMargins(0, 8, 0, 8)
+        nav.setSpacing(12)
+        brand = QLabel("МедРегистр")
+        brand.setProperty("role", "brand")
+        nav.addWidget(brand)
+        scope = QLabel("Детская\nгастроэнтерология")
+        scope.setProperty("role", "muted")
+        nav.addWidget(scope)
+        nav.addSpacing(28)
+        patients = QPushButton("Пациенты")
+        patients.setProperty("role", "nav")
+        patients.setCheckable(True)
+        patients.setChecked(True)
+        patients.clicked.connect(lambda: (patients.setChecked(True), self.load()))
+        nav.addWidget(patients)
+        pharmacy = QPushButton("Склад")
+        pharmacy.setProperty("role", "nav")
+        pharmacy.clicked.connect(self.open_reports)
+        nav.addWidget(pharmacy)
+        nav.addStretch()
+        theme_button = QPushButton("Светлая / тёмная тема")
+        theme_button.setProperty("role", "nav")
+        from design import toggle_theme
+        theme_button.clicked.connect(lambda: toggle_theme(QApplication.instance()))
+        nav.addWidget(theme_button)
+        hint = QLabel("Планируйте введения.\nКонтролируйте остатки.")
+        hint.setProperty("role", "muted")
+        nav.addWidget(hint)
+        frame.addWidget(nav_widget)
+        sheet = QFrame()
+        sheet.setObjectName("workSheet")
+        content = QVBoxLayout(sheet)
+        content.setContentsMargins(24, 24, 24, 24)
+        content.setSpacing(16)
+        header = QHBoxLayout()
+        title = QLabel("Пациенты")
         title.setProperty("role", "title")
-        l.addWidget(title)
-
-        top_row = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch()
+        add = QPushButton("Добавить пациента")
+        add.setProperty("role", "primary")
+        add.clicked.connect(self.add)
+        header.addWidget(add)
+        content.addLayout(header)
+        sub = QLabel("Паспортная часть, анализы и календарь терапии")
+        sub.setProperty("role", "muted")
+        content.addWidget(sub)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Поиск по ФИО или диагнозу (МКБ-10)...")
+        self.search_box.setPlaceholderText("Поиск по ФИО или диагнозу МКБ-10")
+        self.search_box.setAccessibleName("Поиск пациентов")
+        self.search_box.setClearButtonEnabled(True)
         self.search_box.textChanged.connect(self.apply_filter)
-        top_row.addWidget(self.search_box)
-
-        reports_btn = QPushButton("📊 Отчёты")
-        reports_btn.setProperty("role", "accent")
-        reports_btn.setFixedWidth(120)
-        reports_btn.clicked.connect(self.open_reports)
-        top_row.addWidget(reports_btn)
-        l.addLayout(top_row)
-
+        content.addWidget(self.search_box)
         self.t = QTableWidget()
         self.t.setColumnCount(4)
         self.t.setHorizontalHeaderLabels(["ФИО", "Дата рождения", "МКБ-10", "Пол"])
-        self.t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.t.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.t.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.t.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.t.verticalHeader().hide()
+        self.t.verticalHeader().setDefaultSectionSize(48)
+        self.t.setShowGrid(False)
         self.t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.t.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.t.setAlternatingRowColors(True)
         self.t.doubleClicked.connect(self.view)
-        l.addWidget(self.t)
-
-        self.status_label = QLabel("")
+        content.addWidget(self.t, 1)
+        self.status_label = QLabel()
         self.status_label.setProperty("role", "muted")
-        l.addWidget(self.status_label)
-
-        h = QHBoxLayout()
-        add = QPushButton("Добавить")
-        edit = QPushButton("Редактировать")
-        edit.setProperty("role", "secondary")
+        content.addWidget(self.status_label)
+        actions = QHBoxLayout()
         view = QPushButton("Просмотреть")
-        view.setProperty("role", "secondary")
-
-        add.clicked.connect(self.add)
-        edit.clicked.connect(self.edit)
         view.clicked.connect(self.view)
-
-        h.addWidget(add)
-        h.addWidget(edit)
-        h.addWidget(view)
-        l.addLayout(h)
-
-        self.setLayout(l)
-        self.data = []      # все пациенты
-        self.filtered = []  # то, что реально отображается в таблице сейчас
+        edit = QPushButton("Редактировать")
+        edit.clicked.connect(self.edit)
+        self.therapy_button = QPushButton("План терапии")
+        self.therapy_button.clicked.connect(self.open_planner)
+        actions.addWidget(view)
+        actions.addWidget(edit)
+        actions.addStretch()
+        actions.addWidget(self.therapy_button)
+        content.addLayout(actions)
+        frame.addWidget(sheet, 1)
+        self.data = []
+        self.filtered = []
         self.load()
 
     def load(self):
@@ -1726,17 +1634,31 @@ class App(QWidget):
         self.load()
 
     def open_reports(self):
-        win = ReportsWindow()
-        win.exec()
+        from medication_ui import PharmacyWindow
+        PharmacyWindow(DB_NAME, parent=self).exec()
+        self.load()
+
+    def open_planner(self):
+        p = self.get()
+        if not p:
+            QMessageBox.information(self, "Пациент", "Выберите пациента в таблице.")
+            return
+        from medication_ui import TherapyPlanner
+        TherapyPlanner(DB_NAME, p[0], parent=self).exec()
+        self.load()
 
 
 # =========================
 # RUN
 # =========================
 if __name__ == "__main__":
-    init_db()
     app = QApplication(sys.argv)
-    app.setStyleSheet(STYLE_SHEET)
-    w = App()
+    configure_app(app)
+    try:
+        init_db()
+        w = App()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        QMessageBox.critical(None, "Ошибка открытия базы данных", str(exc))
+        sys.exit(1)
     w.show()
     sys.exit(app.exec())

@@ -5,7 +5,7 @@ import sqlite3
 
 from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
+    QApplication, QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -31,6 +31,8 @@ def date_editor(value=None):
     editor = QDateEdit(value or QDate.currentDate())
     editor.setCalendarPopup(True)
     editor.setDisplayFormat("dd.MM.yyyy")
+    from design import style_calendar
+    style_calendar(editor.calendarWidget(), QApplication.instance().property("theme") == "dark")
     return editor
 
 
@@ -556,12 +558,12 @@ class PharmacyWindow(QDialog):
         super().__init__(parent)
         self.db_path = str(db_path)
         medication.initialize_medication(self.db_path)
-        self.setWindowTitle("Аптека и потребность в препаратах")
+        self.setWindowTitle("Склад")
         self.resize(1160, 760)
         self.setMinimumSize(900, 620)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.addWidget(label("Аптека и потребность", "title"))
+        layout.addWidget(label("Склад", "title"))
         layout.addWidget(label("Учёт в целых флаконах и шприцах. Резерв по плану и страховой запас показаны отдельно.", "muted"))
         tabs = QTabWidget()
         layout.addWidget(tabs)

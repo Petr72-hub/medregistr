@@ -145,10 +145,10 @@ class StorageTests(unittest.TestCase):
 
     def test_path_precedence(self):
         with patch.dict('os.environ',{'MEDREGISTR_DB':str(self.db)}):
-            self.assertEqual(storage.resolve_paths(),(self.db,self.db.parent/'files'))
+            self.assertEqual(storage.resolve_paths(),(self.db.resolve(),self.db.resolve().parent/'files'))
         with patch.dict('os.environ',{},clear=True), patch.object(storage.sys,'frozen',True,create=True), \
                 patch.object(storage.sys,'executable',str(self.db.parent/'App.exe')):
-            self.assertEqual(storage.resolve_paths()[0],self.db)
+            self.assertEqual(storage.resolve_paths()[0],self.db.resolve())
 
 
 if __name__ == '__main__':

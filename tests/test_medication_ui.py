@@ -26,7 +26,7 @@ def sandbox(tmp_path, monkeypatch, app):
     monkeypatch.setattr(bot, "DB_NAME", path)
     bot.init_db()
     with closing(sqlite3.connect(path)) as connection:
-        connection.execute("INSERT INTO patients(id,last,first,birth,weight) VALUES(1,'Тест','Пример','01.01.2015',25)")
+        connection.execute("INSERT INTO patients(id,last,first,birth,weight,mkb) VALUES(1,'Тест','Пример','01.01.2015',25,'K50 Болезнь Крона')")
         connection.commit()
     med.initialize_medication(path)
     errors = []
@@ -86,7 +86,12 @@ def test_adalimumab_support_options_are_fixed_mg_and_uc_rejected(sandbox):
     planner.weight_spin.setValue(50)
     planner.preview_plan()
     assert all(float(event["dose_mg"]) == 20 for event in planner.preview_events)
-    planner.diagnosis_box.setCurrentIndex(planner.diagnosis_box.findData("UC"))
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("UPDATE patients SET mkb=? WHERE id=1", ("K51 Язвенный колит",))
+        connection.commit()
+    planner = configured(path)
+    planner.drug_box.setCurrentText("Адалимумаб")
+    planner.phase_box.setCurrentIndex(planner.phase_box.findData("maintenance"))
     planner.preview_plan()
     assert errors
     assert not planner.save_button.isEnabled()

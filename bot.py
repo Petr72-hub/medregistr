@@ -11,10 +11,7 @@ from storage import resolve_paths, prepare_database, save_analyses
 
 DB_NAME, FILES_DIR = resolve_paths()
 
-MKB_CODES = [
-    "K29 Гастрит", "K21 ГЭРБ", "K52 Гастроэнтерит", "K25 Язва желудка",
-    "K26 Язва 12ПК", "K58 СРК", "E11 Диабет", "B15 Гепатит A"
-]
+from diagnoses import MKB_CODES
 
 CLINICS = ["Поликлиника №1", "Поликлиника №2", "Поликлиника №5"]
 

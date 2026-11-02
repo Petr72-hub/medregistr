@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 
 import medication
+from diagnoses import therapy_diagnosis
 
 
 DRUGS = ("Инфликсимаб", "Ведолизумаб", "Адалимумаб")
@@ -143,11 +144,12 @@ class TherapyPlanner(QDialog):
         medication.initialize_medication(self.db_path)
         connection = sqlite3.connect(self.db_path)
         try:
-            patient = connection.execute("SELECT last,first,middle,birth,weight FROM patients WHERE id=?", (pid,)).fetchone()
+            patient = connection.execute("SELECT last,first,middle,birth,weight,mkb FROM patients WHERE id=?", (pid,)).fetchone()
         finally:
             connection.close()
         if patient is None:
             raise ValueError("Пациент не найден.")
+        self.passport_diagnosis = patient[5]
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.addWidget(label(" ".join(str(part) for part in patient[:3] if part), "title"))
@@ -183,8 +185,9 @@ class TherapyPlanner(QDialog):
         self.phase_box.addItem("Индукция и последующая поддержка", "induction")
         self.phase_box.addItem("Только поддерживающая терапия", "maintenance")
         self.diagnosis_box = QComboBox()
-        self.diagnosis_box.addItem("Болезнь Крона", "Crohn")
-        self.diagnosis_box.addItem("Язвенный колит", "UC")
+        diagnosis_label, diagnosis_key = therapy_diagnosis(self.passport_diagnosis)
+        self.diagnosis_box.addItem(diagnosis_label, diagnosis_key)
+        self.diagnosis_box.setToolTip("Диагноз из паспортной части. Для изменения откройте паспорт пациента.")
         self.weight_spin = QDoubleSpinBox()
         self.weight_spin.setDecimals(2)
         self.weight_spin.setRange(0, 10000)
@@ -325,7 +328,7 @@ class TherapyPlanner(QDialog):
         induction = self.phase_box.currentData() == "induction"
         uc = self.diagnosis_box.currentData() == "UC"
         limited = drug == "Адалимумаб" and uc
-        self.diagnosis_box.setEnabled(drug == "Адалимумаб")
+        self.diagnosis_box.setEnabled(False)
         self.dose_box.setEnabled(not limited)
         self.interval_box.setEnabled(not limited)
         self.custom_maintenance.setEnabled(induction and not limited)

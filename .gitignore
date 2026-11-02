@@ -11,3 +11,4 @@ backups/
 build/
 dist/
 *.db.backup-*
+.taste-skill/

@@ -6,10 +6,10 @@ from PyQt6.QtWidgets import *
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
-DB_NAME = "children.db"
-FILES_DIR = "files"
-if not os.path.exists(FILES_DIR):
-    os.makedirs(FILES_DIR)
+from uuid import uuid4
+from storage import resolve_paths, prepare_database, save_analyses
+
+DB_NAME, FILES_DIR = resolve_paths()
 
 MKB_CODES = [
     "K29 Гастрит", "K21 ГЭРБ", "K52 Гастроэнтерит", "K25 Язва желудка",
@@ -299,6 +299,7 @@ ANALYSIS_DEFS = {
 # DB
 # =========================
 def init_db():
+    prepare_database(DB_NAME)
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     cur.execute("""
@@ -617,71 +618,91 @@ class PatientForm(QDialog):
 
     def format_phone(self):
         digits = re.sub(r"\D", "", self.phone.text())
-        if digits.startswith("8"):
-            digits = "7" + digits[1:]
-        if len(digits) >= 11:
+        if len(digits) == 10 and digits.startswith("9"):
+            digits = "7" + digits
+        if len(digits) == 11 and digits[0] in "78":
             formatted = f"+7({digits[1:4]})-{digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
             self.phone.blockSignals(True)
             self.phone.setText(formatted)
             self.phone.blockSignals(False)
 
     def save(self):
-        if not confirm(self, "Вы уверены, что хотите сохранить?"):
+        if self.readonly:
             return
-
         if not self.last.text().strip() or not self.first.text().strip():
             QMessageBox.warning(self, "Ошибка", "Заполните хотя бы фамилию и имя.")
             return
-
+        try:
+            birth = datetime.strptime(self.birth.text().strip(), "%d.%m.%Y")
+            if birth.date() > datetime.now().date():
+                raise ValueError()
+        except ValueError:
+            QMessageBox.warning(self, "Ошибка", "Укажите действительную дату рождения ДД.ММ.ГГГГ, не позднее сегодняшнего дня.")
+            return
+        self.format_phone()
+        phone = self.phone.text().strip()
+        if phone and not re.fullmatch(r"\+7\(9\d{2}\)-\d{3}-\d{2}-\d{2}", phone):
+            QMessageBox.warning(self, "Ошибка", "Введите мобильный номер: +7(9XX)-XXX-XX-XX.")
+            return
         weight_text = self.weight.text().strip().replace(",", ".")
         weight_val = None
         if weight_text:
             try:
                 weight_val = float(weight_text)
+                if not math.isfinite(weight_val) or weight_val <= 0:
+                    raise ValueError()
             except ValueError:
-                QMessageBox.warning(self, "Ошибка", "Вес должен быть числом, например 28.5")
+                QMessageBox.warning(self, "Ошибка", "Вес должен быть положительным числом, например 28.5.")
                 return
-
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-
+        if not confirm(self, "Вы уверены, что хотите сохранить?"):
+            return
         data = (
-            self.last.text(), self.first.text(), self.middle.text(),
-            self.birth.text(), self.mkb.currentText(),
-            self.gender.currentText(),
-            self.addr_reg.text(), self.addr_fact.text(),
-            self.clinic.currentText(), self.uch.text(),
-            self.doctor.text(), self.phone.text(),
-            int(self.invalid.isChecked()), weight_val
+            self.last.text().strip(), self.first.text().strip(), self.middle.text().strip(),
+            birth.strftime("%d.%m.%Y"), self.mkb.currentText(), self.gender.currentText(),
+            self.addr_reg.text(), self.addr_fact.text(), self.clinic.currentText(),
+            self.uch.text(), self.doctor.text(), phone, int(self.invalid.isChecked()), weight_val
         )
-
-        if self.p:
-            cur.execute("""
-            UPDATE patients SET
-            last=?,first=?,middle=?,birth=?,mkb=?,gender=?,
-            address_reg=?,address_fact=?,clinic=?,uch=?,doctor=?,phone=?,invalid=?,weight=?
-            WHERE id=?
-            """, (*data, self.p[0]))
-            self.saved_id = self.p[0]
-        else:
-            cur.execute("""
-            INSERT INTO patients(
-            last,first,middle,birth,mkb,gender,address_reg,address_fact,
-            clinic,uch,doctor,phone,invalid,weight
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, data)
-            self.saved_id = cur.lastrowid
-
-        con.commit()
-        con.close()
+        con = None
+        try:
+            con = sqlite3.connect(DB_NAME)
+            with con:
+                if self.p:
+                    result = con.execute("""UPDATE patients SET
+                        last=?,first=?,middle=?,birth=?,mkb=?,gender=?,address_reg=?,address_fact=?,
+                        clinic=?,uch=?,doctor=?,phone=?,invalid=?,weight=? WHERE id=?""", (*data, self.p[0]))
+                    if result.rowcount != 1:
+                        raise ValueError("Пациент уже удалён. Обновите список.")
+                    self.saved_id = self.p[0]
+                else:
+                    self.saved_id = con.execute("""INSERT INTO patients(
+                        last,first,middle,birth,mkb,gender,address_reg,address_fact,
+                        clinic,uch,doctor,phone,invalid,weight) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", data).lastrowid
+        except (sqlite3.Error, ValueError) as exc:
+            QMessageBox.warning(self, "Ошибка сохранения", str(exc))
+            return
+        finally:
+            if con is not None:
+                con.close()
         self.accept()
 
     def cancel(self):
-        if confirm(self, "Вы уверены, что хотите отменить?"):
-            self.reject()
+        self.reject()
+
+    def reject(self):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            event.accept()
+        else:
+            event.ignore()
 
     def load_data(self):
-        p = self.p
+        p = tuple("" if value is None else value for value in self.p)
+        for combo, value in [(self.mkb, p[5]), (self.gender, p[6]), (self.clinic, p[9])]:
+            if value and combo.findText(value) == -1:
+                combo.addItem(value)
         self.last.setText(p[1])
         self.first.setText(p[2])
         self.middle.setText(p[3])
@@ -707,196 +728,205 @@ class AnalysisWindow(QDialog):
         super().__init__()
         self.pid = pid
         self.readonly = readonly
-        self.blocks = []  # list of dicts: type, start, count, file, db_id, btn
-
+        self.blocks = []
         self.setWindowTitle("Анализы — просмотр" if readonly else "Анализы")
-        self.resize(750, 550)
-
-        l = QVBoxLayout()
-
-        self.t = QTableWidget()
-        self.t.setColumnCount(5)
-        self.t.setHorizontalHeaderLabels(
-            ["Анализ", "Показатель", "Результат", "Ед. изм.", "Файл"]
-        )
+        self.resize(900, 600)
+        layout = QVBoxLayout(self)
+        self.t = QTableWidget(0, 5)
+        self.t.setHorizontalHeaderLabels(["Анализ", "Показатель", "Результат", "Ед. изм.", "Файл"])
         self.t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        l.addWidget(self.t)
-
-        btn_row = QHBoxLayout()
+        layout.addWidget(self.t)
+        buttons = QHBoxLayout()
         if not readonly:
-            add_btn = QPushButton("+")
-            add_btn.setFixedWidth(40)
-            add_btn.clicked.connect(self.on_add)
-            btn_row.addWidget(add_btn)
-
-        btn_row.addStretch()
-
-        if readonly:
-            close_btn = QPushButton("Закрыть")
-            close_btn.setProperty("role", "secondary")
-            close_btn.clicked.connect(self.accept)
-            btn_row.addWidget(close_btn)
-        else:
-            save_btn = QPushButton("Сохранить")
-            cancel_btn = QPushButton("Отмена")
-            cancel_btn.setProperty("role", "secondary")
-            save_btn.clicked.connect(self.save)
-            cancel_btn.clicked.connect(self.cancel)
-            btn_row.addWidget(save_btn)
-            btn_row.addWidget(cancel_btn)
-
-        l.addLayout(btn_row)
-        self.setLayout(l)
-
+            add = QPushButton("+")
+            add.clicked.connect(self.on_add)
+            buttons.addWidget(add)
+            save = QPushButton("Сохранить")
+            save.clicked.connect(self.save)
+            buttons.addWidget(save)
+        close = QPushButton("Закрыть" if readonly else "Отмена")
+        close.clicked.connect(self.accept if readonly else self.cancel)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
         self.load_existing()
 
     def load_existing(self):
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        cur.execute("SELECT id, type, data, file FROM analyses WHERE pid=? ORDER BY id", (self.pid,))
-        rows = cur.fetchall()
-        con.close()
-        for rid, atype, data_json, file_path in rows:
-            data = json.loads(data_json) if data_json else {}
-            if atype not in ANALYSIS_DEFS:
-                continue
-            self.add_block(atype, values=data, file_path=file_path, db_id=rid)
+        from storage import load_analyses
+        try:
+            rows = load_analyses(DB_NAME, self.pid)
+        except (sqlite3.Error, ValueError) as exc:
+            QMessageBox.warning(self, "Ошибка загрузки", str(exc))
+            self.readonly = True
+            return
+        for record in rows:
+            self.add_block(record["type"], record["data"], record["file"],
+                           record["db_id"], malformed=record.get("malformed", False))
 
     def on_add(self):
-        atype, ok = QInputDialog.getItem(
-            self, "Добавить анализ", "Выберите тип анализа:",
-            list(ANALYSIS_DEFS.keys()), 0, False
-        )
-        if ok and atype:
-            self.add_block(atype)
+        if not self.readonly:
+            self.add_block("")
 
-    def add_block(self, atype, values=None, file_path=None, db_id=None):
-        defs = ANALYSIS_DEFS[atype]
+    def add_block(self, atype, values=None, file_path=None, db_id=None, malformed=False):
+        values = dict(values or {})
+        definitions = list(ANALYSIS_DEFS.get(atype, []))
+        known = {label for label, _ in definitions}
+        definitions.extend((str(key), "") for key in values if key not in known)
+        if not definitions:
+            definitions = [("Выберите тип анализа" if not atype else "Результат", "")]
         start = self.t.rowCount()
-        self.t.setRowCount(start + len(defs))
-
-        for i, (label, unit) in enumerate(defs):
-            row = start + i
-
-            item0 = QTableWidgetItem(atype if i == 0 else "")
-            item0.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 0, item0)
-
-            item1 = QTableWidgetItem(label)
-            item1.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 1, item1)
-
-            val = values.get(label, "") if values else ""
-            item2 = QTableWidgetItem(val)
-            if self.readonly:
-                item2.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 2, item2)
-
-            item3 = QTableWidgetItem(unit)
-            item3.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self.t.setItem(row, 3, item3)
-
-        self.t.setSpan(start, 0, len(defs), 1)
-        self.t.setSpan(start, 4, len(defs), 1)
-
-        idx = len(self.blocks)
+        self.t.setRowCount(start + len(definitions))
+        block = {"type": atype, "start": start, "count": len(definitions), "file": file_path,
+                 "db_id": db_id, "values": values, "malformed": malformed, "pending_file": None}
+        self.blocks.append(block)
+        idx = len(self.blocks) - 1
+        for offset, (label, unit) in enumerate(definitions):
+            row = start + offset
+            for column, text in [(0, atype if offset == 0 else ""), (1, label),
+                                 (2, str(values.get(label, ""))), (3, unit)]:
+                item = QTableWidgetItem(text)
+                if column != 2 or self.readonly or malformed or not atype or isinstance(values.get(label), (dict, list)):
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.t.setItem(row, column, item)
+        if len(definitions) > 1:
+            self.t.setSpan(start, 0, len(definitions), 1)
+            self.t.setSpan(start, 4, len(definitions), 1)
+        if not atype:
+            choice = QComboBox()
+            choice.addItem("Выберите анализ…")
+            choice.addItems(ANALYSIS_DEFS)
+            choice.currentTextChanged.connect(partial(self.select_type, idx))
+            self.t.setCellWidget(start, 0, choice)
+        elif malformed:
+            self.t.item(start, 0).setText(f"{atype} (старые данные, только просмотр)")
         btn = QPushButton()
-        self.blocks.append({
-            "type": atype, "start": start, "count": len(defs),
-            "file": file_path, "db_id": db_id, "btn": btn
-        })
-        self.update_file_btn(idx)
+        block["btn"] = btn
         btn.clicked.connect(partial(self.handle_file, idx))
         self.t.setCellWidget(start, 4, btn)
+        self.update_file_btn(idx)
+
+    def block_values(self, block):
+        values = dict(block["values"])
+        for offset in range(block["count"]):
+            row = block["start"] + offset
+            label = self.t.item(row, 1).text()
+            if not isinstance(values.get(label), (dict, list)):
+                values[label] = self.t.item(row, 2).text()
+        return values
+
+    def select_type(self, idx, atype):
+        if atype not in ANALYSIS_DEFS:
+            return
+        records = []
+        for index, block in enumerate(self.blocks):
+            records.append((atype if index == idx else block["type"],
+                            {} if index == idx else self.block_values(block),
+                            block["file"], block["db_id"], block["malformed"], block["pending_file"]))
+        self.blocks = []
+        self.t.clearSpans()
+        self.t.setRowCount(0)
+        for kind, values, path, rid, malformed, pending in records:
+            self.add_block(kind, values, path, rid, malformed)
+            self.blocks[-1]["pending_file"] = pending
+            self.update_file_btn(len(self.blocks) - 1)
 
     def update_file_btn(self, idx):
         block = self.blocks[idx]
-        btn = block["btn"]
-        if block["file"]:
-            btn.setText(f"📎 {os.path.basename(block['file'])}")
-        else:
-            btn.setText("Нет файла" if self.readonly else "Добавить файл")
-            if self.readonly:
-                btn.setEnabled(False)
+        path = block["pending_file"] or block["file"]
+        block["btn"].setText(os.path.basename(path) if path else
+                             ("Нет файла" if self.readonly else "Добавить файл"))
+        block["btn"].setEnabled(bool(path) or (not self.readonly and not block["malformed"]))
+
+    def file_path(self, path):
+        if os.path.isabs(path):
+            return path
+        database_dir = os.path.dirname(os.path.abspath(DB_NAME))
+        resolved = os.path.join(database_dir, path)
+        if not os.path.isfile(resolved) and os.path.basename(database_dir).lower() == "dist":
+            legacy = os.path.abspath(os.path.join(database_dir, os.pardir, path))
+            legacy_files = os.path.abspath(os.path.join(database_dir, os.pardir, "files"))
+            if os.path.commonpath([legacy, legacy_files]) == legacy_files and os.path.isfile(legacy):
+                return legacy
+        return resolved
+
+    def open_file(self, path):
+        resolved = self.file_path(path)
+        if not os.path.isfile(resolved):
+            QMessageBox.warning(self, "Файл", "Файл не найден на диске.")
+        elif not QDesktopServices.openUrl(QUrl.fromLocalFile(resolved)):
+            QMessageBox.warning(self, "Файл", "Не удалось открыть файл. Проверьте приложение для этого типа файлов.")
 
     def handle_file(self, idx):
         block = self.blocks[idx]
-
-        if self.readonly:
-            if block["file"] and os.path.exists(block["file"]):
-                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(block["file"])))
-            else:
-                QMessageBox.information(self, "Файл", "Файл не найден.")
+        path = block["pending_file"] or block["file"]
+        if self.readonly or block["malformed"]:
+            if path:
+                self.open_file(path)
             return
-
-        if block["file"]:
+        if path:
             box = QMessageBox(self)
             box.setWindowTitle("Файл анализа")
             box.setText("Файл уже прикреплён. Что сделать?")
             open_btn = box.addButton("Открыть", QMessageBox.ButtonRole.AcceptRole)
-            replace_btn = box.addButton("Заменить", QMessageBox.ButtonRole.DestructiveRole)
+            replace_btn = box.addButton("Заменить", QMessageBox.ButtonRole.ActionRole)
             box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
             box.exec()
-            clicked = box.clickedButton()
-            if clicked == open_btn:
-                if os.path.exists(block["file"]):
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(block["file"])))
-                else:
-                    QMessageBox.warning(self, "Файл", "Файл не найден на диске.")
+            if box.clickedButton() == open_btn:
+                self.open_file(path)
                 return
-            elif clicked != replace_btn:
+            if box.clickedButton() != replace_btn:
                 return
-
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл анализа")
-        if not path:
-            return
-
-        os.makedirs(FILES_DIR, exist_ok=True)
-        basename = os.path.basename(path)
-        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        dest_name = f"pid{self.pid}_{block['type']}_{stamp}_{basename}"
-        dest_name = re.sub(r"[^\w\.\-А-Яа-яЁё]", "_", dest_name)
-        dest_path = os.path.join(FILES_DIR, dest_name)
-        shutil.copy(path, dest_path)
-
-        block["file"] = dest_path
-        self.update_file_btn(idx)
+        chosen, _ = QFileDialog.getOpenFileName(self, "Выберите файл анализа")
+        if chosen:
+            block["pending_file"] = os.path.abspath(chosen)
+            self.update_file_btn(idx)
 
     def save(self):
+        if self.readonly:
+            return
+        if any(not block["type"] for block in self.blocks):
+            QMessageBox.warning(self, "Анализы", "Выберите тип каждого добавленного анализа.")
+            return
         if not confirm(self, "Вы уверены, что хотите сохранить?"):
             return
-
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-
-        for block in self.blocks:
-            data = {}
-            for i in range(block["count"]):
-                row = block["start"] + i
-                label = self.t.item(row, 1).text()
-                value = self.t.item(row, 2).text()
-                data[label] = value
-            data_json = json.dumps(data, ensure_ascii=False)
-
-            if block["db_id"]:
-                cur.execute(
-                    "UPDATE analyses SET data=?, file=? WHERE id=?",
-                    (data_json, block["file"], block["db_id"])
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO analyses(pid, type, data, file, created_at) VALUES(?,?,?,?,?)",
-                    (self.pid, block["type"], data_json, block["file"],
-                     datetime.now().strftime("%d.%m.%Y %H:%M"))
-                )
-
-        con.commit()
-        con.close()
+        copied = []
+        records = []
+        try:
+            for block in self.blocks:
+                if block["malformed"]:
+                    continue  # Keep the original invalid JSON untouched in SQLite.
+                path = block["file"]
+                if block["pending_file"]:
+                    os.makedirs(FILES_DIR, exist_ok=True)
+                    name = uuid4().hex + "_" + os.path.basename(block["pending_file"])
+                    destination = os.path.join(FILES_DIR, name)
+                    copied.append(destination)
+                    shutil.copy2(block["pending_file"], destination)
+                    path = os.path.relpath(destination, os.path.dirname(os.path.abspath(DB_NAME)))
+                records.append({"db_id": block["db_id"], "type": block["type"],
+                                "data": self.block_values(block), "file": path})
+            save_analyses(DB_NAME, self.pid, records)
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            for path in copied:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            QMessageBox.warning(self, "Ошибка сохранения", str(exc))
+            return
         self.accept()
 
     def cancel(self):
-        if confirm(self, "Вы уверены, что хотите отменить?"):
-            self.reject()
+        self.reject()
+
+    def reject(self):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.readonly or confirm(self, "Вы уверены, что хотите отменить?"):
+            event.accept()
+        else:
+            event.ignore()
 
 
 # =========================
@@ -910,6 +940,7 @@ class AddTherapyDialog(QDialog):
         self.pid = pid
         self.weight_kg = weight_kg
         self.result_data = None
+        self._calc_cache = None
 
         self.setWindowTitle("Добавить назначение препарата")
         self.resize(520, 480)
@@ -981,6 +1012,7 @@ class AddTherapyDialog(QDialog):
         l.addLayout(btn_row)
 
         self.setLayout(l)
+        self.diag_box.currentTextChanged.connect(self.recalc)
         self.rebuild()
 
     def current_drug_cfg(self):
@@ -1042,6 +1074,7 @@ class AddTherapyDialog(QDialog):
         return doses[week_index]
 
     def recalc(self):
+        self._calc_cache = None
         cfg = self.current_drug_cfg()
         stage = self.stage_box.currentText()
         vial_mg = cfg["vial_mg"]
@@ -1051,8 +1084,8 @@ class AddTherapyDialog(QDialog):
         dose_label = "-"
         interval_weeks = None
 
-        if not weight:
-            self.res_dose.setText("Доза: невозможно рассчитать без веса пациента")
+        if not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+            self.res_dose.setText("Доза: укажите конечный положительный вес пациента")
             self.res_total.setText("Требуется, мг: -")
             self.res_vials.setText("Флаконов/шприцов: -")
             self.res_waste.setText("Остаток при введении, мг: -")
@@ -1140,6 +1173,14 @@ class AddTherapyDialog(QDialog):
         return bands[0] if bands else None
 
     def save(self):
+        try:
+            date_text = self.date_edit.text().strip()
+            if not re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", date_text):
+                raise ValueError()
+            administration_date = datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
+        except ValueError:
+            QMessageBox.warning(self, "Ошибка", "Укажите действительную дату введения ДД.ММ.ГГГГ.")
+            return
         if not self._calc_cache:
             QMessageBox.warning(self, "Ошибка", "Расчёт дозы не выполнен — проверьте вес пациента и выбранные параметры.")
             return
@@ -1152,7 +1193,7 @@ class AddTherapyDialog(QDialog):
 
         self.result_data = {
             "pid": self.pid,
-            "date": self.date_edit.text(),
+            "date": administration_date,
             "drug": self.drug_box.currentText(),
             "diagnosis": self.diag_box.currentText() if cfg.get("requires_diagnosis") else None,
             "stage": stage,
@@ -1590,7 +1631,8 @@ class PatientCard(QDialog):
     def open_analyses(self):
         readonly = self.mode == "view"
         win = AnalysisWindow(self.pid, readonly=readonly)
-        win.exec()
+        if win.exec() == QDialog.DialogCode.Accepted and not readonly:
+            self.accept()
 
     def open_therapy(self):
         readonly = self.mode == "view"
@@ -1734,9 +1776,13 @@ class App(QWidget):
 # RUN
 # =========================
 if __name__ == "__main__":
-    init_db()
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE_SHEET)
-    w = App()
+    try:
+        init_db()
+        w = App()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        QMessageBox.critical(None, "Ошибка открытия базы данных", str(exc))
+        sys.exit(1)
     w.show()
     sys.exit(app.exec())

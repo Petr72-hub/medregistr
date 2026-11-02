@@ -1,0 +1,13 @@
+.venv/
+.serena/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+*.db-*
+*.sqlite*
+files/
+backups/
+build/
+dist/
+*.db.backup-*

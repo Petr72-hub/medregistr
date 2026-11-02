@@ -12,3 +12,8 @@ build/
 dist/
 *.db.backup-*
 .taste-skill/
+
+release/
+.build-preview*/
+MedRegister-preview.spec
+.build-env/
